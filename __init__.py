@@ -69,17 +69,23 @@ def _no_filter(node):
     yield None
 
 
-# @contextlib.contextmanager
-# def merge_gradients(node):
-#     if isinstance(node, tf.Operation) and 'gradients_' in node.name:
-#         # Average over the 'tower' dimension.
-#         grad = tf.concat(axis=0, values=[node, ....])
-#         yield tf.reduce_mean(grad, 0)
-#     else:
-#         yield None
+@contextlib.contextmanager
+def merge_gradients(node, copier, purpose, *arg, **kw):
+    if isinstance(node, tf.Operation) and 'gradients_' in node.name:
+        if purpose == 'original_gradient':
+            yield None
+        else:
+            yield tf.reduce_mean(
+                tf.concat(
+                    axis=0,
+                    values=[copier.copy(node, 'original_gradient')
+                            for copier in copier.multiple.node_copiers]),
+                0)        
+    else:
+        yield None
         
 @contextlib.contextmanager
-def filter_variables(node):
+def filter_variables(node, *arg, **kw):
     if isinstance(node, tf.Operation) and node.type == 'VariableV2':
         yield node
     elif (    isinstance(node, tf.Operation)
@@ -92,16 +98,16 @@ def filter_variables(node):
 
 def set_device(device):
     @contextlib.contextmanager
-    def set_device(node):
+    def set_device(node, *arg, **kw):
         with tf.device(device):
             yield node
     return set_device
 
 def _chain_2_filters(filter1, filter2):
     @contextlib.contextmanager
-    def filter(node):
-        with filter1(node) as node1:
-            with filter2(node1) as node2:
+    def filter(node, *arg, **kw):
+        with filter1(node, *arg, **kw) as node1:
+            with filter2(node1, *arg, **kw) as node2:
                 yield node2
     return filter
 
@@ -131,10 +137,13 @@ class SingleNodeCopier(object):
     def __contains__(self, node):
         return id(node) in self.mapping
     
-    def copy(self, node):
-        if id(node) in self.mapping:
-            return self.mapping[id(node)]
-        with self.filter(node) as filtered:
+    def copy(self, node, purpose = None):
+        key = id(node)
+        if purpose is not None:
+            key = (key, purpose)
+        if key in self.mapping:
+            return self.mapping[key]
+        with self.filter(node, copier=self, purpose=purpose) as filtered:
             if filtered is not None:
                 res = filtered
             else:
@@ -144,7 +153,7 @@ class SingleNodeCopier(object):
                     res = self.copy_op(node)
                 else:
                     raise ValueError("Unknown node type %s: %s" % (type(node), node))
-        self.mapping[id(node)] = res
+        self.mapping[key] = res
         return res
                 
     def copy_op(self, node):
