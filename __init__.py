@@ -68,14 +68,14 @@ def _no_filter(node):
     yield None
 
 
-@contextlib.contextmanager
-def merge_gradients(node):
-    if isinstance(node, tf.Operation) and 'gradients_' in node.name:
-        # Average over the 'tower' dimension.
-        grad = tf.concat(axis=0, values=[node, ....])
-        yield tf.reduce_mean(grad, 0)
-    else:
-        yield None
+# @contextlib.contextmanager
+# def merge_gradients(node):
+#     if isinstance(node, tf.Operation) and 'gradients_' in node.name:
+#         # Average over the 'tower' dimension.
+#         grad = tf.concat(axis=0, values=[node, ....])
+#         yield tf.reduce_mean(grad, 0)
+#     else:
+#         yield None
         
 @contextlib.contextmanager
 def filter_variables(node):
