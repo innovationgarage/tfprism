@@ -10,6 +10,7 @@ import keras.layers
 import tensorflow as tf
 import contextlib
 import copy
+import types
 
 def patch(origfn):
     def wrapper(newfn):
@@ -111,16 +112,25 @@ def chain_filters(*filters):
         return _chain_2_filters(filters[0], chain_filters(*filters[1:]))
 
 
-class NodeCopier(object):
-    def __new__(cls, node, filter = _no_filter, prefix = 'copy_'):
-        self = object.__new__(cls)
+class SingleNodeCopier(object):
+    def __init__(self, filter = _no_filter, prefix = 'copy_'):
         self.filter = filter
         self.prefix = prefix
         self.mapping = {}
+
+    @classmethod
+    def copy_node(cls, node, *arg, **kw):
+        self = cls(*arg, **kw)
         res = self.copy(node)
-        res._copy_mapping = self.mapping
+        res._prism_copier = self
         return res
 
+    def __getitem__(self, node):
+        return self.copy(node)
+
+    def __contains__(self, node):
+        return id(node) in self.mapping
+    
     def copy(self, node):
         if id(node) in self.mapping:
             return self.mapping[id(node)]
@@ -158,17 +168,39 @@ class NodeCopier(object):
         op = self.copy(node.op)
         return op.outputs[idx]
 
-def mangle_feed_dict(feed_dict, node_copies):
+class MultipleNodeCopier(object):
+    def __init__(self, *node_copiers):
+        if len(node_copiers) == 1 and isinstance(node_copiers[0], (types.GeneratorType, list, tuple)):
+            node_copiers = node_copiers[0]
+        self.node_copiers = list(node_copiers)
+        for node_copier in self.node_copiers:
+            node_copier.multiple = self
+
+    @classmethod
+    def copy_node(cls, node, *arg, **kw):
+        self = cls(*arg, **kw)
+        res = self.copy(node)
+        for copier, copy in zip(self.node_copiers, res):
+            copy._prism_copier = copier
+        return res
+
+    def __getitem__(self, node):
+        return self.copy(node)
+
+    def copy(self, node):
+        return [copier.copy(node) for copier in self.node_copiers]
+        
+def mangle_feed_dict(feed_dict, multiple_node_copier):
     res = {}
     batchlen = None
     for key, value in feed_dict.iteritems():
         if batchlen is None:
-            batchlen = len(value) % len(node_copies)
-        for idx, node_copy in enumerate(node_copies):
-            if id(key) not in node_copy._copy_mapping:
+            batchlen = len(value) % len(multiple_node_copier.node_copiers)
+        for idx, node_copier in enumerate(multiple_node_copier.node_copiers):
+            if key not in node_copier:
                 res[key] = value
                 break
-            res[node_copy._copy_mapping[id(key)]] = value[batchlen * idx:batchlen * (idx+1),:]
+            res[node_copier[key]] = value[batchlen * idx:batchlen * (idx+1),:]
     return res
 
 @patch(keras.layers.Layer.add_weight)
