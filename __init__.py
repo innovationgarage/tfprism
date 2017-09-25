@@ -64,63 +64,64 @@ def format_node(node, indent = '', depth=None, done=None):
             output
         )
 
-@contextlib.contextmanager
-def _no_filter(node):
-    yield None
+def _is_merged_gradient(node, copier, dependencies, **kw):
+    for category in ('inputs', 'control_inputs'):
+        for item in dependencies[category]:
+            if hasattr(item, '_merged_gradient'):
+                return True
+    return False
 
+def merge_gradients(node, copier, purpose=None, **kw):
+    if not isinstance(node, tf.Operation):
+        return None
 
-@contextlib.contextmanager
-def merge_gradients(node, copier, purpose, *arg, **kw):
-    if isinstance(node, tf.Operation) and 'gradients_' in node.name:
+    elif 'gradients_' in node.name:
         if purpose == 'original_gradient':
-            yield None
+            return None
         else:
-            yield tf.reduce_mean(
-                tf.concat(
-                    axis=0,
-                    values=[copier.copy(node, 'original_gradient')
-                            for copier in copier.multiple.node_copiers]),
-                0)        
+            if copier.multiple.node_copiers.index(copier) != 0:
+                return copier.multiple.node_copiers[0].copy(node)
+            else:
+                res = tf.reduce_mean(
+                    tf.concat(
+                        axis=0,
+                        values=[other_copier.copy(node, 'original_gradient')
+                                for other_copier in copier.multiple.node_copiers]),
+                    0)
+                res._merged_gradient = True
+                return res
+
+    elif _is_merged_gradient(node=node, copier=copier, purpose=purpose, **kw):
+        if copier.multiple.node_copiers.index(copier) != 0:
+            return copier.multiple.node_copiers[0].copy(node)
+        else:
+            res = copier.apply_next_filter(node=node, copier=copier, purpose=purpose, **kw)
+            res._merged_gradient = True
+            return res
+
     else:
-        yield None
+        return None
         
-@contextlib.contextmanager
-def filter_variables(node, *arg, **kw):
+def filter_variables(node, copier, **kw):
     if isinstance(node, tf.Operation) and node.type == 'VariableV2':
-        yield node
+        return  node
     elif (    isinstance(node, tf.Operation)
           and node.type == 'Identity'
           and len(node.inputs) == 1
           and node.inputs[0].op.type == 'VariableV2'):
-        yield node
+        return node
     else:
-        yield None
+        return None
 
 def set_device(device):
-    @contextlib.contextmanager
-    def set_device(node, *arg, **kw):
+    def set_device(copier, **kw):
         with tf.device(device):
-            yield node
+            return copier.apply_next_filter(copier=copier, **kw)
     return set_device
 
-def _chain_2_filters(filter1, filter2):
-    @contextlib.contextmanager
-    def filter(node, *arg, **kw):
-        with filter1(node, *arg, **kw) as node1:
-            with filter2(node1, *arg, **kw) as node2:
-                yield node2
-    return filter
-
-def chain_filters(*filters):
-    if len(filters) == 1:
-        return filters[0]
-    else:
-        return _chain_2_filters(filters[0], chain_filters(*filters[1:]))
-
-
 class SingleNodeCopier(object):
-    def __init__(self, filter = _no_filter, prefix = 'copy_'):
-        self.filter = filter
+    def __init__(self, filters = (), prefix = 'copy_'):
+        self.filters = filters + (self._copy,)
         self.prefix = prefix
         self.mapping = {}
 
@@ -136,46 +137,93 @@ class SingleNodeCopier(object):
 
     def __contains__(self, node):
         return id(node) in self.mapping
+
+    def apply_next_filter(self, node, filters, **kw):
+        res = None
+        while res is None:
+            filter = filters[0]
+            filters = filters[1:]
+            res = filter(node=node, filters=filters, **kw)
+        return res
     
-    def copy(self, node, purpose = None):
+    def copy(self, node, purpose=None, **kw):
         key = id(node)
         if purpose is not None:
             key = (key, purpose)
         if key in self.mapping:
             return self.mapping[key]
-        with self.filter(node, copier=self, purpose=purpose) as filtered:
-            if filtered is not None:
-                res = filtered
-            else:
-                if isinstance(node, tf.Tensor):
-                    res = self.copy_tensor(node)
-                elif isinstance(node, tf.Operation):
-                    res = self.copy_op(node)
-                else:
-                    raise ValueError("Unknown node type %s: %s" % (type(node), node))
+        res = self.apply_next_filter(
+            node=node,
+            dependencies=self.copy_dependencies(node=node, purpose=purpose, **kw),
+            filters=self.filters,
+            copier=self,
+            purpose=purpose,
+            **kw)
         self.mapping[key] = res
         return res
-                
-    def copy_op(self, node):
+
+    def _copy(self, node, **kw):
+        if isinstance(node, tf.Tensor):
+            return self.copy_tensor(node=node, **kw)
+        elif isinstance(node, tf.Operation):
+            return self.copy_op(node=node, **kw)
+        else:
+            raise ValueError("Unknown node type %s: %s" % (type(node), node))
+
+    def copy_dependencies(self, node, purpose=None, **kw):
+        if isinstance(node, tf.Tensor):
+            return self.copy_tensor_dependencies(node=node, purpose=purpose, **kw)
+        elif isinstance(node, tf.Operation):
+            return self.copy_op_dependencies(node=node, purpose=purpose, **kw)
+        else:
+            raise ValueError("Unknown node type %s: %s" % (type(node), node))
+    
+    def copy_tensor_dependencies(self, node, **kw):
+        return {
+            'op': self.copy(node.op)
+        }
+
+    def copy_op_inputs(self, node):
+        return [self.copy(input) for input in node.inputs]
+
+    def copy_op_control_inputs(self, node):
+        return [self.copy(input) for input in node.control_inputs]
+
+    def copy_op_output_dtypes(self, node):
+        return [to.dtype for to in node.outputs]
+
+    def copy_op_attrs(self, node):
         attrs = dict(node.node_def.attr)
         if '_class' in attrs:
             attrs['_class'] = tf.AttrValue(list=tf.AttrValue.ListValue(s=[
                 name.replace("@", "@%s" % self.prefix) for name in node.get_attr('_class')]))
-        with tf.control_dependencies([self.copy(input) for input in node.control_inputs]):
+        return attrs
+
+    def copy_op_dependencies(self, node, **kw):
+        return {
+            'op_type': node.type,
+            'control_inputs': self.copy_op_control_inputs(node),
+            'inputs': self.copy_op_inputs(node),
+            'dtypes': self.copy_op_output_dtypes(node),
+            'name': self.prefix + node.name,
+            'attrs': self.copy_op_attrs(node),
+        }
+
+    def create_op(self, control_inputs, **kw):
+        with tf.control_dependencies(control_inputs):
             return tf.get_default_graph().create_op(
-                node.type,
-                [self.copy(input) for input in node.inputs],
-                [to.dtype for to in node.outputs],
-                name=self.prefix + node.name,
-                attrs=attrs,
                 compute_shapes=True,
-                compute_device=True
+                compute_device=True,
+                **kw
             )
+        
+    def copy_op(self, node, dependencies, **kw):
+        return self.create_op(
+            **dependencies)
     
-    def copy_tensor(self, node):
+    def copy_tensor(self, node, dependencies, **kw):
         idx = node.op.outputs.index(node)
-        op = self.copy(node.op)
-        return op.outputs[idx]
+        return dependencies['op'].outputs[idx]
 
 class MultipleNodeCopier(object):
     def __init__(self, *node_copiers):
