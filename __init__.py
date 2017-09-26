@@ -65,29 +65,51 @@ def format_node(node, indent = '', depth=None, done=None):
         )
 
 def _is_merged_gradient(node, copier, dependencies, **kw):
+    if 'op' in dependencies:
+        return hasattr(dependencies['op'], '_merged_gradient')
     for category in ('inputs', 'control_inputs'):
         for item in dependencies[category]:
             if hasattr(item, '_merged_gradient'):
                 return True
     return False
 
+def _is_gradient_head(node, copier, **kw):
+    if not isinstance(node, tf.Operation) or 'gradients' not in node.name:
+        return False
+    for output in node.outputs:
+        for consumer in output.consumers():
+            if 'gradients' in consumer.name:
+                return False
+    return True
+            
 def merge_gradients(node, copier, purpose=None, **kw):
-    if not isinstance(node, tf.Operation):
-        return None
-
-    elif 'gradients_' in node.name:
+    if _is_gradient_head(node=node, copier=copier, purpose=purpose, **kw):
         if purpose == 'original_gradient':
             return None
         else:
             if copier.multiple.node_copiers.index(copier) != 0:
                 return copier.multiple.node_copiers[0].copy(node)
             else:
-                res = tf.reduce_mean(
-                    tf.concat(
-                        axis=0,
-                        values=[other_copier.copy(node, 'original_gradient')
-                                for other_copier in copier.multiple.node_copiers]),
-                    0)
+                inputs = [other_copier.copy(node, 'original_gradient')
+                          for other_copier in copier.multiple.node_copiers]
+                if not node.outputs:
+                    with tf.control_dependencies(inputs):
+                        res = tf.get_default_graph().create_op(
+                            'NoOp',
+                            [],
+                            [],
+                            name=copier.prefix + 'gradient_merge/' + node.name,
+                            compute_shapes=True,
+                            compute_device=True)
+                else:
+                    with tf.name_scope(copier.prefix + 'gradient_merge'):
+                        res = tf.reduce_mean(
+                            tf.stack(
+                                axis=0,
+                                values=[input.outputs[0] for input in inputs]),
+                            0)
+                    res._merged_gradient = True
+                    res = res.op
                 res._merged_gradient = True
                 return res
 
@@ -245,7 +267,10 @@ class MultipleNodeCopier(object):
         return self.copy(node)
 
     def copy(self, node):
-        return [copier.copy(node) for copier in self.node_copiers]
+        res = [copier.copy(node) for copier in self.node_copiers]
+        seen = set()
+        res = [x for x in res if not (x in seen or seen.add(x))]
+        return res
         
 def mangle_feed_dict(feed_dict, multiple_node_copier):
     res = {}
