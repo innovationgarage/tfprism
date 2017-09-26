@@ -1,2 +1,5 @@
 *~
+logs/*
+training.log
+nohup.out
 *.pyc
