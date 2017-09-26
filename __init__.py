@@ -271,21 +271,32 @@ class MultipleNodeCopier(object):
         seen = set()
         res = [x for x in res if not (x in seen or seen.add(x))]
         return res
-        
-def mangle_feed_dict(feed_dict, multiple_node_copier):
-    res = {}
-    batchlen = None
-    for key, value in feed_dict.iteritems():
-        if key not in multiple_node_copier.node_copiers[0]:
-            res[key] = value
-        else:
-            if batchlen is None:
-                batchlen = len(value) / len(multiple_node_copier.node_copiers)
-            # print "Batch for %s: %s of %s examples, %s towers" % (key.name, batchlen, len(value), len(multiple_node_copier.node_copiers))
-            for idx, node_copier in enumerate(multiple_node_copier.node_copiers):
-                assert key in node_copier
-                res[node_copier[key]] = value[batchlen * idx:batchlen * (idx+1),:]
-    return res
+
+    def mangle_feed_dict(self, feed_dict):
+        res = {}
+        batchlen = None
+        for key, value in feed_dict.iteritems():
+            if key not in self.node_copiers[0]:
+                res[key] = value
+            else:
+                if batchlen is None:
+                    batchlen = len(value) / len(self.node_copiers)
+                # print "Batch for %s: %s of %s examples, %s towers" % (key.name, batchlen, len(value), len(self.node_copiers))
+                for idx, node_copier in enumerate(self.node_copiers):
+                    assert key in node_copier
+                    res[node_copier[key]] = value[batchlen * idx:batchlen * (idx+1),:]
+        return res
+
+def distribute_graph_on_all_tasks(node, sess):
+    tasks = list_tasks(sess)
+    node_copier = MultipleNodeCopier(
+        SingleNodeCopier(
+            (merge_gradients, filter_variables, set_device(task)),
+            task[1:].replace(":", "_") + "/")
+        for task in tasks
+    )
+    nodes = node_copier.copy(node)
+    return nodes, node_copier
 
 @patch(keras.layers.Layer.add_weight)
 @keras.legacy.interfaces.legacy_add_weight_support
