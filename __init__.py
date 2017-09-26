@@ -276,13 +276,15 @@ def mangle_feed_dict(feed_dict, multiple_node_copier):
     res = {}
     batchlen = None
     for key, value in feed_dict.iteritems():
-        if batchlen is None:
-            batchlen = len(value) % len(multiple_node_copier.node_copiers)
-        for idx, node_copier in enumerate(multiple_node_copier.node_copiers):
-            if key not in node_copier:
-                res[key] = value
-                break
-            res[node_copier[key]] = value[batchlen * idx:batchlen * (idx+1),:]
+        if key not in multiple_node_copier.node_copiers[0]:
+            res[key] = value
+        else:
+            if batchlen is None:
+                batchlen = len(value) / len(multiple_node_copier.node_copiers)
+            # print "Batch for %s: %s of %s examples, %s towers" % (key.name, batchlen, len(value), len(multiple_node_copier.node_copiers))
+            for idx, node_copier in enumerate(multiple_node_copier.node_copiers):
+                assert key in node_copier
+                res[node_copier[key]] = value[batchlen * idx:batchlen * (idx+1),:]
     return res
 
 @patch(keras.layers.Layer.add_weight)
