@@ -1,12 +1,3 @@
-# From https://stackoverflow.com/a/44216268
-# Hacked for non-gpu devices by egil@innovationgarage
-
-from keras import backend as K
-from keras.models import Model
-from keras.layers import Input
-from keras.layers.core import Lambda
-from keras.layers.merge import Concatenate
-import keras.layers
 import tensorflow as tf
 import contextlib
 import copy
@@ -298,59 +289,6 @@ def distribute_graph_on_all_tasks(node, sess):
     nodes = node_copier.copy(node)
     return nodes, node_copier
 
-@patch(keras.layers.Layer.add_weight)
-@keras.legacy.interfaces.legacy_add_weight_support
-def add_weight(origfn,
-               self,
-               name,
-               shape,
-               dtype=None,
-               initializer=None,
-               regularizer=None,
-               trainable=True,
-               constraint=None):
-    """Adds a weight variable to the layer.
-
-    # Arguments
-        name: String, the name for the weight variable.
-        shape: The shape tuple of the weight.
-        dtype: The dtype of the weight.
-        initializer: An Initializer instance (callable).
-        regularizer: An optional Regularizer instance.
-        trainable: A boolean, whether the weight should
-            be trained via backprop or not (assuming
-            that the layer itself is also trainable).
-        constraint: An optional Constraint instance.
-
-    # Returns
-        The created weight variable.
-    """
-    initializer = initializers.get(initializer)
-    if dtype is None:
-        dtype = K.floatx()
-    weight = K.variable(initializer(shape),
-                        dtype=dtype,
-                        name=name,
-                        constraint=constraint)
-    if regularizer is not None:
-        self.add_loss(regularizer(weight))
-    if trainable:
-        self._trainable_weights.append(weight)
-    else:
-        self._non_trainable_weights.append(weight)
-    return weight
-
-
-def slice_batch(x, n_workers, part):
-    """
-    Divide the input batch into [n_workers] slices, and obtain slice number [part].
-    i.e. if len(x)=10, then slice_batch(x, 2, 1) will return x[5:].
-    """
-    sh = K.shape(x)
-    L = sh[0] // n_workers
-    if part == n_workers - 1:
-        return x[part*L:]
-    return x[part*L:(part+1)*L]
 
 def list_devices(sess, filter='/job:worker'):
     return [d.name for d in sess.list_devices()
@@ -361,29 +299,3 @@ def list_tasks(sess, *arg, **kw):
                              for part in device.split('/')
                              if part == '' or 'job:' in part or 'task:' in part)
                     for device in list_devices(sess, *arg, **kw)))
-
-    
-def parallelize(model, ps_server='/job:ps', workers=['/job:worker/task:0']):
-    """
-    Given a keras [model], return an equivalent model which parallelizes
-    the computation over [n_workers] GPUs.
-
-    Each GPU gets a slice of the input batch, applies the model on that slice
-    and later the outputs of the models are concatenated to a single tensor, 
-    hence the user sees a model that behaves the same as the original.
-    """
-    with tf.device(ps_server):
-        x = Input(model.input_shape[1:], name=model.input_names[0])
-
-    towers = []
-    for g, worker in enumerate(workers):
-        with tf.device(worker):
-            slice_g = Lambda(slice_batch, 
-                             lambda shape: shape, 
-                             arguments={'n_workers':len(workers), 'part':g})(x)
-            towers.append(model(slice_g))
-
-    with tf.device(ps_server):
-        merged = Concatenate(axis=0)(towers)
-
-    return Model(inputs=[x], outputs=[merged])
