@@ -13,6 +13,10 @@ def patch(origfn):
     return wrapper
 
 def format_node(node, indent = '', depth=None, done=None):
+    """Format a tensorflow (sub)graph to text as a tree.
+    node: the tf op to use as the tree root node, typically your training op or loss op
+    depth: optional, maximum numbers of levels to print
+    """
     if depth == 0:
         return '%s...\n' % indent
     if depth is not None:
@@ -74,6 +78,13 @@ def _is_gradient_head(node, copier, **kw):
     return True
             
 def merge_gradients(node, copier, purpose=None, **kw):
+    """Filter for SingleNodeCopier that merges the output of all gradient
+    calculations into a single copy. It also collapses all ops that
+    uses (recursively) the gradients into single copies.
+
+    This can be used together with filter_variables to implement data
+    parallelism.
+    """
     if _is_gradient_head(node=node, copier=copier, purpose=purpose, **kw):
         if purpose == 'original_gradient':
             return None
@@ -116,6 +127,9 @@ def merge_gradients(node, copier, purpose=None, **kw):
         return None
         
 def filter_variables(node, copier, **kw):
+    """Filter for SingleNodeCopier that keeps variables from being copied.
+    Variables are instead shared among all copies made of the graph.
+    """
     if isinstance(node, tf.Operation) and node.type == 'VariableV2':
         return  node
     elif (    isinstance(node, tf.Operation)
@@ -127,12 +141,57 @@ def filter_variables(node, copier, **kw):
         return None
 
 def set_device(device):
+    """Returns a filter for SingleNodeCopier that assigns copied nodes to
+    a certain device."""
     def set_device(copier, **kw):
         with tf.device(device):
             return copier.apply_next_filter(copier=copier, **kw)
     return set_device
 
 class SingleNodeCopier(object):
+    """SingleNodeCopier and MultipleNodeCopier provides the basis
+    functionality that TFPrism is built on top of. SingleNodeCopier
+    provides a mechanism to copy a (sub)graph, applying a set of
+    filters and transforms while doing so.
+
+    MultipleNodeCopier adds the functionality to make multiple copies
+    of the graph at the same time, and the filters/transforms being
+    aware of this and able to make connections between nodes in the
+    graph copies.
+
+    Each node copier keeps track of what nodes it has copied and only
+    ever makes a single copy of the whole graph.
+
+        copier = SingleNodeCopier(filters=(filter1,...filterN), prefix="uniq_node_name_prefix_")
+        node1_copy = copier.copy(node1)
+        node1_copy = copier[node1] # Alternative syntax for the above
+        # Will work, even if node2 references node1; node2_copy will
+        # reference node1_copy
+        node2_copy = copier[node2]
+        assert node1 in copier # Check if node1 has been copied
+        assert node1_copy is copier[node1]
+
+    It is sometimes usefull to be able to make multiple "copies" of
+    the same node withing the destination graph, for example to wrap a
+    node copy inside some other operation.
+
+        node_copier.copy(node1, purpose="original_gradient")
+
+    Filters are functions of the form
+
+        def my_filter(node, copier, purpose, **kw):
+            if should_node_be_shared(node):
+                return node
+            elif should_node_be_multiplied(node) and purpose != 'original':
+                # Replace node in the copy with something totally else...
+                return tf.MatMul(copier.copy(node, purpose='original'), tf.Variable())
+            elif should_node_be_on_device(node):
+                with tf.device("/job:worker"):
+                    return copier.apply_next_filter(node, purpose=purpose, **kw)
+            else:
+                return None
+    """
+
     def __init__(self, filters = (), prefix = 'copy_'):
         self.filters = filters + (self._copy,)
         self.prefix = prefix
@@ -239,6 +298,22 @@ class SingleNodeCopier(object):
         return dependencies['op'].outputs[idx]
 
 class MultipleNodeCopier(object):
+    """SingleNodeCopier and MultipleNodeCopier provides the basis
+    functionality that TFPrism is built on top of. MultipleNodeCopier
+    provides a mechanism to make multiple copies of a (sub)graph,
+    applying a set of filters and transforms across all copies in
+    tandem.
+
+    copier = MultipleNodeCopier(
+        SingleNodeCopier(filters=filters1, prefix="prefix1_"),
+        SingleNodeCopier(filters=filters2, prefix="prefix2_")
+        ...)
+ 
+    node_copies = copier.copy(node)
+
+    sess.run(node_copies, feed_dict=copier.mangle_feed_dict(feed_dict))
+    """
+
     def __init__(self, *node_copiers):
         if len(node_copiers) == 1 and isinstance(node_copiers[0], (types.GeneratorType, list, tuple)):
             node_copiers = node_copiers[0]
@@ -279,6 +354,12 @@ class MultipleNodeCopier(object):
         return res
 
 def distribute_graph_on_all_tasks(node, sess):
+    """Takes a train_step node generated by a optimizer minimize() call
+    and parallelizes it using data parallelism on all /job:worker nodes in a cluster.
+
+    Returns (train_steps, copier), where copier.mangle_feed_dict can
+    be used as described in the help for MultipleNodeCopier.
+    """
     tasks = list_tasks(sess)
     node_copier = MultipleNodeCopier(
         SingleNodeCopier(
@@ -291,10 +372,16 @@ def distribute_graph_on_all_tasks(node, sess):
 
 
 def list_devices(sess, filter='/job:worker'):
+    """List all device names for a session, filtering by the
+    filter string, by default '/job:worker'"""
     return [d.name for d in sess.list_devices()
      if filter in d.name]
 
 def list_tasks(sess, *arg, **kw):
+    """List task names for a cluster, filtered by a filter string, by
+    default '/job:worker'. This is different from list_devices in that
+    it only returns strings on the form '/job:worker/task:5'.
+    """
     return list(set('/'.join(part
                              for part in device.split('/')
                              if part == '' or 'job:' in part or 'task:' in part)
