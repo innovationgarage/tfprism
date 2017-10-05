@@ -2,6 +2,7 @@ import tensorflow as tf
 import contextlib
 import copy
 import types
+import collections
 
 def patch(origfn):
     def wrapper(newfn):
@@ -196,7 +197,8 @@ class SingleNodeCopier(object):
         self.filters = filters + (self._copy,)
         self.prefix = prefix
         self.mapping = {}
-
+        self.stack = collections.deque()
+        
     @classmethod
     def copy_node(cls, node, *arg, **kw):
         self = cls(*arg, **kw)
@@ -217,22 +219,105 @@ class SingleNodeCopier(object):
             filters = filters[1:]
             res = filter(node=node, filters=filters, **kw)
         return res
-    
-    def copy(self, node, purpose=None, **kw):
+
+    def key(self, node, purpose=None):
         key = id(node)
         if purpose is not None:
             key = (key, purpose)
-        if key in self.mapping:
-            return self.mapping[key]
-        res = self.apply_next_filter(
-            node=node,
-            dependencies=self.copy_dependencies(node=node, purpose=purpose, **kw),
-            filters=self.filters,
-            copier=self,
-            purpose=purpose,
-            **kw)
-        self.mapping[key] = res
-        return res
+        return key
+    
+    def enqueue(self, node, purpose=None):
+        if self.key(node, purpose) in self.mapping:
+            return
+        dependencies = collections.deque()
+        self.collect_dependencies(dependencies, node)
+        self.stack.append((node, purpose, dependencies))
+
+    def dequeue(self):
+        if not self.stack:
+            return True
+        dependencies = self.stack[-1][2]
+        if len(dependencies):
+            self.enqueue(dependencies.pop())
+        else:
+            node, purpose, dependencies = self.stack.pop()
+            key = self.key(node, purpose)
+            if key not in self.mapping:
+                self.mapping[key] = self.apply_next_filter(
+                    node=node,
+                    dependencies=self.get_dependency_copies(node),
+                    filters=self.filters,
+                    copier=self,
+                    purpose=purpose)
+        return False
+        
+    def collect_dependencies(self, deque, node):
+        if isinstance(node, tf.Tensor):
+            self.collect_tensor_dependencies(deque, node)
+        elif isinstance(node, tf.Operation):
+            self.collect_op_dependencies(deque, node)
+        else:
+            raise ValueError("Unknown node type %s: %s" % (type(node), node))
+    
+    def collect_tensor_dependencies(self, deque, node):
+        deque.append(node.op)
+
+    def collect_op_inputs(self, deque, node):
+        for input in node.inputs:
+            deque.append(input)
+
+    def collect_op_control_inputs(self, deque, node):
+        for input in node.control_inputs:
+            deque.append(input)
+
+    def collect_op_dependencies(self, deque, node):
+        self.collect_op_control_inputs(deque, node)
+        self.collect_op_inputs(deque, node)
+
+    def get_dependency_copies(self, node):
+        if isinstance(node, tf.Tensor):
+            return self.get_tensor_dependency_copies(node)
+        elif isinstance(node, tf.Operation):
+            return self.get_op_dependency_copies(node)
+        else:
+            raise ValueError("Unknown node type %s: %s" % (type(node), node))
+    
+    def get_tensor_dependency_copies(self, node):
+        return {
+            'op': self.mapping[self.key(node.op)]
+        }
+
+    def get_op_input_copies(self, node):
+        return [self.mapping[self.key(input)] for input in node.inputs]
+
+    def get_op_control_input_copies(self, node):
+        return [self.mapping[self.key(input)] for input in node.control_inputs]
+
+    def get_op_output_dtypes(self, node):
+        return [to.dtype for to in node.outputs]
+
+    def get_op_attrs(self, node):
+        attrs = dict(node.node_def.attr)
+        if '_class' in attrs:
+            attrs['_class'] = tf.AttrValue(list=tf.AttrValue.ListValue(s=[
+                name.replace("@", "@%s" % self.prefix) for name in node.get_attr('_class')]))
+        return attrs
+
+    def get_op_dependency_copies(self, node):
+        return {
+            'op_type': node.type,
+            'control_inputs': self.get_op_control_input_copies(node),
+            'inputs': self.get_op_input_copies(node),
+            'dtypes': self.get_op_output_dtypes(node),
+            'name': self.prefix + node.name,
+            'attrs': self.get_op_attrs(node),
+        }
+        
+    def copy(self, node, purpose=None):
+        self.enqueue(node, purpose)
+        while not self.dequeue():
+            pass
+        return self.mapping[self.key(node, purpose)]
 
     def _copy(self, node, **kw):
         if isinstance(node, tf.Tensor):
@@ -241,45 +326,6 @@ class SingleNodeCopier(object):
             return self.copy_op(node=node, **kw)
         else:
             raise ValueError("Unknown node type %s: %s" % (type(node), node))
-
-    def copy_dependencies(self, node, purpose=None, **kw):
-        if isinstance(node, tf.Tensor):
-            return self.copy_tensor_dependencies(node=node, purpose=purpose, **kw)
-        elif isinstance(node, tf.Operation):
-            return self.copy_op_dependencies(node=node, purpose=purpose, **kw)
-        else:
-            raise ValueError("Unknown node type %s: %s" % (type(node), node))
-    
-    def copy_tensor_dependencies(self, node, **kw):
-        return {
-            'op': self.copy(node.op)
-        }
-
-    def copy_op_inputs(self, node):
-        return [self.copy(input) for input in node.inputs]
-
-    def copy_op_control_inputs(self, node):
-        return [self.copy(input) for input in node.control_inputs]
-
-    def copy_op_output_dtypes(self, node):
-        return [to.dtype for to in node.outputs]
-
-    def copy_op_attrs(self, node):
-        attrs = dict(node.node_def.attr)
-        if '_class' in attrs:
-            attrs['_class'] = tf.AttrValue(list=tf.AttrValue.ListValue(s=[
-                name.replace("@", "@%s" % self.prefix) for name in node.get_attr('_class')]))
-        return attrs
-
-    def copy_op_dependencies(self, node, **kw):
-        return {
-            'op_type': node.type,
-            'control_inputs': self.copy_op_control_inputs(node),
-            'inputs': self.copy_op_inputs(node),
-            'dtypes': self.copy_op_output_dtypes(node),
-            'name': self.prefix + node.name,
-            'attrs': self.copy_op_attrs(node),
-        }
 
     def create_op(self, control_inputs, **kw):
         with tf.control_dependencies(control_inputs):
